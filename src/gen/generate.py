@@ -16,6 +16,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from src.common import config as C  # noqa: E402
+from src.common.lock import data_lock  # noqa: E402
 
 # A single "hot" zone that receives a disproportionate share of pickups. Real key
 # distributions are never uniform, and the skew experiment needs a victim.
@@ -72,6 +73,11 @@ def _make_part(args):
 
 def generate(scale: str, skew: bool = False, workers: int = 0,
              hot_share: float = HOT_SHARE) -> None:
+    with data_lock(C.DATA_ROOT, f"generate --scale {scale}"):
+        _generate(scale, skew, workers, hot_share)
+
+
+def _generate(scale: str, skew: bool, workers: int, hot_share: float) -> None:
     cfg = C.scale_cfg(scale)
     rows_per_part = cfg["rows"] // cfg["files"]
     workers = workers or min(mp.cpu_count(), cfg["files"])

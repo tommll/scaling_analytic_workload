@@ -92,32 +92,53 @@ Host: i7-1365U, node = 1 pinned core + 2 GB. Median of 3 timed runs, warm-up dis
 
 ![strong scaling](results/strong_scaling.png)
 
-**Scalability is a property of the job size, not of the code.** At 30M rows Spark goes
-70.3s → 35.9s → 32.1s on 1 → 2 → 4 nodes: **1.96x at two nodes** (98% efficiency, right on
-the host's own measured ceiling) then flattening to 2.19x at four. Run the identical code
-on 10M rows and the curve is flat, because the per-job fixed costs stop being noise.
-Nothing about the pipeline changed between those two lines — only how much work each node
-was given.
+**Scaling gains plateau; the coordination tax is what shrinks.** Adding data does not keep
+buying scalability. The 4-node speedup goes 0.80x (10M) → 2.19x (30M) → **2.24x (300M)**:
+it saturates around 2.2x, or 56% efficiency against the host's own 3.94x ceiling, and 300M
+rows buys essentially nothing over 30M. Since the plateau is identical whether or not the
+data fits in page cache, it is structural — shuffle and coordination — not disk.
 
-**The single-node control group wins, and that is the point of having it.**
+What *does* improve monotonically is how much distribution costs you in absolute terms:
 
-| 30M rows | compute | wall |
+| dataset | one 4-core box | Spark, 4 nodes | Spark is |
+|---|---|---|---|
+| 10M rows | 4.2s | 46.2s | 11.1x slower |
+| 30M rows | 9.0s | 32.1s | 3.6x slower |
+| **300M rows** | **72.5s** | **112.2s** | **1.6x slower** |
+
+Same code, same total cores, only the job size changed. The fixed costs — JVM startup,
+scheduling, plan construction — are a fatal overhead at 10M and nearly amortised by 300M.
+
+> **Correction.** An earlier version of this README read the 30M column as a steady-state
+> result and reported a "3.6x coordination tax", concluding the cluster would need ~3.6x
+> more cores than the biggest single box to break even. The 300M run shows that number was
+> inflated by fixed costs. The steady-state tax is **1.55x** (1.04M vs 0.67M rows/s/core),
+> so the real break-even is about **6 nodes**, not 15. Measuring one point and calling it
+> an asymptote was the mistake.
+
+**The single-node control group still wins, and that is the point of having it.**
+
+| 300M rows | compute | wall |
 |---|---|---|
-| T1 pandas, 1 node | **OOM-killed** | — |
-| T2 chunked, 1 node | 22.9s | 22.9s |
-| **T2 chunked, one 4-core box** | **9.0s** | **9.0s** |
-| T3 spark, 4 nodes | 32.1s | 53.9s |
+| T1 pandas, 1 node | **OOM-killed** (skipped at this scale) | — |
+| T2 chunked, 1 node (1 core) | 209.6s | 209.6s |
+| **T2 chunked, one 4-core box** | **72.5s** | **72.5s** |
+| T3 spark, 1 node | 251.4s | 270.4s |
+| T3 spark, 2 nodes | 139.6s | 157.2s |
+| T3 spark, 4 nodes | 112.2s | 131.3s |
 
-Four cores in one box beat four one-core nodes by **3.6x on compute and 6x end-to-end**,
-using identical total resources. Per core, Spark moved 234K rows/s against chunked
-pandas's 833K — a **3.6x coordination tax** for shuffles, serialisation, JVM execution and
-two passes over the input where pandas makes one. (Persisting the joined frame to get one
-pass was measured too, and was *worse*: 86s vs 22s at 1 node, because the frame does not
-fit in a 1.4 GB executor and spills.)
+Four cores in one box still beat four one-core nodes on identical total resources — but by
+1.55x, not the 11x seen at 10M. (Persisting the joined frame to make one pass instead of
+two was measured too, and was *worse*: 86s vs 22s at 1 node, because the frame does not fit
+in a 1.4 GB executor and spills.)
 
-So the honest crossover on this hardware: **the cluster needs ~3.6x more cores than the
-biggest single box to break even**, plus ~15-25s of startup on every job. If your data
-fits on one machine, put it on one machine.
+So the honest guidance on this hardware: **if your data fits on one machine, put it on one
+machine** — but the penalty for being wrong about that shrinks fast as the job grows.
+
+One caveat specific to the 300M run: at ~7 GB the dataset exceeds spare page cache, so it
+is the first size measuring real disk I/O — and all four simulated nodes share one NVMe
+where a real cluster would have four. That asymmetry favours the single-box tiers, and the
+1.55x figure should be read as a floor for the cluster, not a verdict.
 
 **Where the single machine simply cannot follow.** At 30M rows on a 2 GB node, T1 is
 OOM-killed (exit 137, `OOMKilled=true`) because peak RSS is O(dataset). T2 peaks at 366 MB
@@ -198,30 +219,40 @@ That third one is the transferable lesson: **calibrate the machine before you bl
 software.** A flat scaling curve is more often the hardware than the framework.
 
 
-### Tuning note: task slots per core
+### Task slots: oversubscribing one core
 
-Two different knobs get called "more parallelism on one node", and they behave nothing
-alike. Measured on one pinned core, 10M rows:
+`make bench EXPERIMENTS=slots` puts N task slots on a single pinned core and races it
+against every other approach. Shuffle partitions are pinned at 16 across all Spark rows so
+slot count is the only variable. 10M rows, median of 3 timed runs:
 
-| configuration | JVMs on the node | compute |
+![task slots](results/slots.png)
+
+| configuration | compute | wall |
 |---|---|---|
-| 1 task slot (the default here) | 2 (worker + 1 executor) | 26.6s |
-| 4 slots as **threads** in one executor (`--cores 4`, `executor.cores=4`) | 2 | 25.9s |
-| 3 slots as separate **executor JVMs** (`executor.cores=1`, `cores.max=3`) | 4 (worker + 3 executors) | **45.3s** |
+| T1 pandas (1 core) | **OOM-killed** | — |
+| T2 chunked (1 core) | 7.7s | 7.7s |
+| **T2 chunked (4-core box)** | **2.5s** | **2.5s** |
+| T3 spark (1 node, 1 slot) | 24.8s | 39.3s |
+| T3 spark (1 node, 2 slots) | 25.2s | 40.2s |
+| T3 spark (1 node, 4 slots) | 25.5s | 41.3s |
+| T3 spark (1 node, 10 slots) | 28.0s | 44.3s |
+| T3 spark (4 nodes, 1 slot) | 22.7s | 44.1s |
 
-Task slots are *threads inside an executor JVM*, so raising `--cores` on a worker costs
-almost nothing and buys almost nothing for CPU-bound work — the core is already saturated.
-Splitting the same core across several executor *processes* is actively harmful: three JVMs
-mean three heaps, three sets of GC threads and real context switching, for a 70% slowdown.
+**Slots do not create capacity.** Going 1 → 10 slots on one core is monotonically *worse*,
+ending 13% slower, with run-to-run ranges tight enough (27.4-28.8s at 10 slots) that it is
+signal, not noise. A slot is a thread inside one executor JVM; ten threads on one core
+timeslice the same silicon while adding context switches, ten sets of task bookkeeping, and
+ten concurrent shuffle writers competing for one 1400 MB heap.
 
-Oversubscription pays only when task slots spend time *waiting* rather than computing (I/O,
-remote reads) or when a few stragglers leave cores idle — smaller, more numerous tasks
-schedule more evenly. This pipeline is CPU-bound on a warm page cache, so it pays nothing.
+Oversubscription pays only when slots *wait* rather than compute — remote object-store
+reads, or stragglers leaving cores idle. This pipeline is CPU-bound on a warm page cache,
+so every extra slot is pure overhead. Real capacity came only from the real fourth node
+(22.7s), and even that is beaten 9x by four cores in one box.
 
-Two hard limits worth knowing before you try: a standalone worker fits
-`floor(worker_memory / executor_memory)` executors, and Spark refuses any
-`spark.executor.memory` below 450 MB. A 1600 MB worker therefore tops out at three.
-
+Related limits, both discovered the hard way: a standalone worker fits
+`floor(worker_memory / executor_memory)` executors, and Spark rejects any
+`spark.executor.memory` below 450 MB. A 1600 MB worker therefore tops out at three executor
+*processes* — and three JVMs sharing one core measured 45.3s, far worse than ten threads.
 
 ---
 

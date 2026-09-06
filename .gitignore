@@ -8,3 +8,4 @@ results/RESULTS.md
 results/spark_plan.txt
 __pycache__/
 *.pyc
+*.lock

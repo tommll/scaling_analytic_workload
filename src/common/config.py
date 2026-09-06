@@ -19,6 +19,11 @@ SCALES = {
     "m": dict(rows=10_000_000, files=32),
     "l": dict(rows=30_000_000, files=64),
     "xl": dict(rows=80_000_000, files=128),
+    # ~7 GB. Deliberately larger than the page cache this host can spare, so it is
+    # the first size that measures real disk I/O rather than warm-cache CPU. Note
+    # every simulated node shares ONE physical disk here; a real cluster would have
+    # one per node, so this size flatters the single-box tiers.
+    "xxl": dict(rows=300_000_000, files=512),
 }
 
 N_ZONES = 265

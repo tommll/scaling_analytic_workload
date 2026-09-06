@@ -71,6 +71,7 @@ def chart_speedup(res, path):
     cal = res["experiments"].get("calibrate", [])
     if not series:
         return None
+    series.sort(key=lambda x: x[-1])  # by row count, so the legend reads in order
     nodes = series[0][1]
     cal_x = [c["nodes"] for c in cal if c["nodes"] <= max(nodes)]
     cal_y = [c["throughput_x"] for c in cal if c["nodes"] <= max(nodes)]
@@ -86,23 +87,32 @@ def chart_speedup(res, path):
         ax.annotate(f"{cal_y[-1]:.1f}x", (cal_x[-1], cal_y[-1]),
                     textcoords="offset points", xytext=(8, -2), color=INK, fontsize=10,
                     fontweight="bold")
-    for (key, xs, ys, lo, hi, n), color in zip(series, (BLUE, AQUA, YELLOW)):
+    for i, ((key, xs, ys, lo, hi, n), color) in enumerate(
+            zip(series, (AQUA, BLUE, YELLOW))):
         ax.errorbar(xs, ys, yerr=[[y - l for y, l in zip(ys, lo)],
                                   [h - y for y, h in zip(ys, hi)]],
                     lw=2, color=color, marker="o", ms=8, mec=SURFACE, mew=2,
                     ecolor=color, elinewidth=1.2, capsize=4, alpha=1.0,
                     zorder=5, label=f"Spark, {n / 1e6:.0f}M rows")
+        # Stagger the end labels: the 30M and 300M curves land within 0.05x of each
+        # other and their labels would otherwise overprint.
         ax.annotate(f"{ys[-1]:.2f}x", (xs[-1], ys[-1]), textcoords="offset points",
-                    xytext=(9, -3), color=INK, fontsize=10, fontweight="bold")
+                    xytext=(11, -3 + (i - len(series) / 2) * 13), color=INK,
+                    fontsize=10, fontweight="bold")
 
     ax.set_xticks(nodes)
     ax.set_xlabel("nodes (1 pinned core + 2 GB each)")
     ax.set_ylabel("speedup vs 1 node")
-    ax.set_title("Strong scaling: the bigger the job, the better it scales", pad=12)
+    # Title states what the data shows. It previously read "the bigger the job, the
+    # better it scales", which the 300M run falsified: 30M and 300M land together.
+    ax.set_title("Strong scaling: gains plateau near 2.2x, whatever the job size",
+                 pad=12)
     ax.legend(frameon=False, loc="upper left", fontsize=9)
-    fig.text(0.5, -0.02, "Median of 3 timed runs, bars show min-max. Compute time "
-             "only; startup charged separately.\nHost ceiling = this machine's own "
-             "measured parallel limit, from `make calibrate`.",
+    reps = sorted({r["reps"] for k in keys for r in res["experiments"][k]
+                   if r.get("reps")})
+    fig.text(0.5, -0.02, f"Median of {'/'.join(map(str, reps))} timed runs, bars show "
+             "min-max. Compute time only; startup charged separately.\nHost ceiling = "
+             "this machine's own measured parallel limit, from `make calibrate`.",
              ha="center", color=MUTED, fontsize=8.5)
     fig.tight_layout()
     fig.savefig(path, dpi=160, bbox_inches="tight")
@@ -117,9 +127,10 @@ def _biggest_strong(res):
     return res["experiments"][keys[-1]] if keys else []
 
 
-def chart_tiers(res, path):
-    """Magnitude comparison across execution models, including the ones that died."""
-    rows = _biggest_strong(res)
+def _tier_bars(rows, title, path, figw=8.0):
+    """Horizontal magnitude comparison across execution models, including any that
+    died. One color per tier, so identity is carried by the axis label and the bar
+    group rather than by hue alone."""
     if not rows:
         return None
     labels = [r["label"] for r in rows]
@@ -128,7 +139,7 @@ def chart_tiers(res, path):
     colors = [BLUE if r["tier"] == "spark" else AQUA if r["tier"] == "chunked"
               else YELLOW for r in rows]
 
-    fig, ax = plt.subplots(figsize=(8.0, 0.44 * len(rows) + 1.6))
+    fig, ax = plt.subplots(figsize=(figw, 0.44 * len(rows) + 1.6))
     _frame(ax, xgrid=True)
     span = max(vals) or 1
     for i, (v, c, good) in enumerate(zip(vals, colors, ok)):
@@ -144,13 +155,27 @@ def chart_tiers(res, path):
     ax.set_yticklabels(list(reversed(labels)), fontsize=9.5)
     ax.set_xlim(0, span * 1.22)
     ax.set_xlabel("compute time (s), median of timed runs - lower is better")
-    n = next((r["rows_in"] for r in rows if r["outcome"] == "ok"), 0)
-    ax.set_title(f"Same pipeline, {len(rows)} execution models ({n:,} rows)", pad=14)
+    ax.set_title(title, pad=14)
     ax.set_ylim(-0.7, len(rows) - 0.3)
     fig.tight_layout()
     fig.savefig(path, dpi=160, bbox_inches="tight")
     plt.close(fig)
     return path
+
+
+def chart_tiers(res, path):
+    rows = _biggest_strong(res)
+    n = next((r["rows_in"] for r in rows if r["outcome"] == "ok"), 0)
+    return _tier_bars(rows, f"Same pipeline, {len(rows)} execution models "
+                            f"({n:,} rows)", path)
+
+
+def chart_slots(res, path):
+    """Oversubscribing one core with task slots, against every other approach."""
+    rows = res["experiments"].get("slots", [])
+    n = next((r["rows_in"] for r in rows if r["outcome"] == "ok"), 0)
+    return _tier_bars(rows, f"Task slots on ONE core vs the alternatives "
+                            f"({n:,} rows)", path, figw=8.4)
 
 
 def chart_overhead(res, path):
@@ -249,6 +274,7 @@ def write_tables(res, path):
                        ["pinned nodes", "wall (s)", "aggregate throughput"]))
     for key, title in (*[(k, f"Strong scaling - {k.split('@')[-1]} dataset")
                          for k in sorted(ex) if k.startswith("strong")],
+                       ("slots", "Task slots on one core"),
                        ("small", "Small data - the crossover"),
                        ("memory", "Memory ceiling"),
                        ("weak", "Weak scaling - data grows with the cluster")):
@@ -281,6 +307,7 @@ def main(results_path: str, out_dir: str):
             chart_tiers(res, f"{out_dir}/tiers.png"),
             chart_overhead(res, f"{out_dir}/overhead.png"),
             chart_memory(res, f"{out_dir}/memory_ceiling.png"),
+            chart_slots(res, f"{out_dir}/slots.png"),
             write_tables(res, f"{out_dir}/RESULTS.md")]
     for m in made:
         print("wrote", m) if m else None

@@ -24,9 +24,13 @@ ps: ## Show which nodes are up
 gen: ## Generate the dataset (SCALE=xs|s|m|l|xl)
 	docker exec baseline-big python3 -m src.gen.generate --scale $(SCALE)
 
-bench: ## Full benchmark suite -> results/results.json (~40 min)
-	python3 -m src.bench.runner --experiments calibrate,strong,small,memory \
-	  --scale $(SCALE) --memory-scale l --small-scale xs --nodes 1,2,4 --reps 3
+EXPERIMENTS ?= calibrate,strong,small,memory
+SKIP_TIERS  ?=
+
+bench: ## Full suite -> results/results.json (~40 min). EXPERIMENTS=slots for the slot sweep.
+	python3 -m src.bench.runner --experiments $(EXPERIMENTS) \
+	  --scale $(SCALE) --memory-scale l --small-scale xs --nodes 1,2,4 \
+	  --slots 1,2,4,10 --reps 3 --skip-tiers "$(SKIP_TIERS)"
 
 bench-quick: ## Fast sanity run of the suite (~6 min)
 	python3 -m src.bench.runner --experiments strong --scale s --nodes 1,2 --reps 1

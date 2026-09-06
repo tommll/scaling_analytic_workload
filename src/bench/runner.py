@@ -19,6 +19,10 @@ import sys
 import time
 from statistics import median
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))))
+from src.common.lock import LOCK_ENV, data_lock  # noqa: E402
+
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 CF = ["docker", "compose", "-f", os.path.join(ROOT, "docker", "docker-compose.yml")]
 PROFILES = [a for i in range(1, 7) for a in ("--profile", f"w{i}")]
@@ -71,7 +75,23 @@ def exec_in(container: str, args: list, env: dict = None) -> subprocess.Complete
     return sh(cmd + [container, "python3", "-m"] + args)
 
 
-def run_once(tier: str, nodes: int, procs: int = 1) -> dict:
+def set_slots(slots: int) -> None:
+    """One node with `slots` task slots.
+
+    A slot is a THREAD inside a single executor JVM, not a process, so this is
+    oversubscribing one physical core rather than adding capacity. Recreating the
+    container is required because a worker's core count is fixed at launch.
+    """
+    for i in range(2, MAX_NODES + 1):
+        sh(["docker", "stop", "-t", "2", f"spark-worker-{i}"])
+    subprocess.run(CF + PROFILES + ["up", "-d", "--force-recreate", "spark-worker-1"],
+                   capture_output=True, text=True,
+                   env=dict(os.environ, WORKER_CORES=str(slots)))
+    time.sleep(8)
+
+
+def run_once(tier: str, nodes: int, procs: int = 1, slots: int = 1,
+             shuffle: int = 0) -> dict:
     if tier == "pandas":
         p = exec_in("baseline", ["src.baseline.pandas_pipeline", "/data/out/pandas"])
     elif tier == "chunked":
@@ -80,30 +100,39 @@ def run_once(tier: str, nodes: int, procs: int = 1) -> dict:
     else:
         p = exec_in("spark-client",
                     ["src.distributed.spark_pipeline", "--out", "/data/out/spark",
-                     "--shuffle-partitions", str(max(nodes * 4, 4))],
-                    {"SPARK_CORES_MAX": nodes, "SPARK_EXPECT_EXECUTORS": nodes})
+                     "--shuffle-partitions",
+                     str(shuffle or max(nodes * slots * 4, 4))],
+                    {"SPARK_CORES_MAX": nodes * slots,
+                     "SPARK_EXECUTOR_CORES": slots,
+                     "SPARK_EXPECT_EXECUTORS": nodes})
     res = last_json(p.stdout)
     if not res:
-        raise RuntimeError(f"{tier}(nodes={nodes},procs={procs}) failed rc={p.returncode}\n"
-                           + p.stdout[-1500:] + p.stderr[-1500:])
+        raise RuntimeError(f"{tier}(nodes={nodes},procs={procs}) failed "
+                           f"rc={p.returncode}\n" + p.stdout[-1500:] + p.stderr[-1500:])
     return res
 
 
-def measure(label: str, tier: str, nodes: int, reps: int, procs: int = 1) -> dict:
-    print(f"    {label:28s}", end="", flush=True)
+def measure(label: str, tier: str, nodes: int, reps: int, procs: int = 1,
+            slots: int = 1, shuffle: int = 0, warmup: bool = True) -> dict:
+    print(f"    {label:30s}", end="", flush=True)
     try:
-        run_once(tier, nodes, procs)  # warm-up, discarded
-        runs = [run_once(tier, nodes, procs) for _ in range(reps)]
+        if warmup:
+            # Discarded: JIT, Parquet footer caching. At the largest scales a warm-up
+            # costs more than it removes -- a 12-minute job JITs in its first seconds
+            # -- so it is skipped there and the min-max spread reports the residue.
+            run_once(tier, nodes, procs, slots, shuffle)
+        runs = [run_once(tier, nodes, procs, slots, shuffle) for _ in range(reps)]
     except RuntimeError as e:
         print("  DIED (see outcome=failed)")
-        return dict(label=label, tier=tier, nodes=nodes, procs=procs,
+        return dict(label=label, tier=tier, nodes=nodes, procs=procs, slots=slots,
                     outcome="failed", error=str(e)[:400])
     walls = [r["wall_s"] for r in runs]
     # For Spark, `compute` excludes cluster startup: startup is a fixed cost that does
     # not shrink with more nodes, so mixing it in hides the scaling signal. Both are
     # reported -- compute answers "does it scale", wall answers "is it worth it".
     comps = [r.get("compute_s", r["wall_s"]) for r in runs]
-    out = dict(label=label, tier=tier, nodes=nodes, procs=procs, outcome="ok",
+    out = dict(label=label, tier=tier, nodes=nodes, procs=procs, slots=slots,
+               outcome="ok",
                wall_s=median(walls), wall_min=min(walls), wall_max=max(walls),
                compute_s=median(comps), compute_min=min(comps), compute_max=max(comps),
                startup_s=median([r.get("startup_s", 0.0) for r in runs]),
@@ -117,7 +146,9 @@ def measure(label: str, tier: str, nodes: int, reps: int, procs: int = 1) -> dic
 
 def gen(scale: str, skew: bool = False) -> str:
     args = ["src.gen.generate", "--scale", scale] + (["--skew"] if skew else [])
-    out = exec_in("baseline-big", args).stdout.strip()
+    # The runner already holds the data lock for the whole run; tell the child so it
+    # does not fail against its own parent.
+    out = exec_in("baseline-big", args, {LOCK_ENV: "1"}).stdout.strip()
     print("    " + out)
     return out
 
@@ -165,17 +196,29 @@ def experiment_calibrate(reps: int = 3) -> list:
     return rows
 
 
-def experiment_strong(scale, node_counts, reps) -> list:
-    """Fixed dataset, growing cluster. 'How much faster on the same job?'"""
-    print(f"\n[strong scaling] fixed {scale} dataset, 1 -> {max(node_counts)} nodes")
+def experiment_strong(scale, node_counts, reps, warmup=True, skip=()) -> list:
+    """Fixed dataset, growing cluster. 'How much faster on the same job?'
+
+    `skip` drops tiers that cannot survive the scale being tested. Past a few tens of
+    millions of rows T1 is a guaranteed OOM, and spending minutes re-proving that on
+    every run adds nothing -- the memory-ceiling experiment already establishes it.
+    """
+    print(f"\n[strong scaling] fixed {scale} dataset, 1 -> {max(node_counts)} nodes"
+          + (f"  (skipping: {', '.join(skip)})" if skip else ""))
     gen(scale)
     set_cluster(0)
-    rows = [measure("T1 pandas (1 node)", "pandas", 1, reps),
-            measure("T2 chunked (1 node)", "chunked", 1, reps, procs=1),
-            measure("T2 chunked (1 big box, 4c)", "chunked", 4, reps, procs=4)]
+    rows = []
+    if "pandas" not in skip:
+        rows.append(measure("T1 pandas (1 node)", "pandas", 1, reps, warmup=warmup))
+    if "chunked" not in skip:
+        rows += [measure("T2 chunked (1 node)", "chunked", 1, reps, procs=1,
+                         warmup=warmup),
+                 measure("T2 chunked (1 big box, 4c)", "chunked", 4, reps, procs=4,
+                         warmup=warmup)]
     for n in node_counts:
         set_cluster(n)
-        rows.append(measure(f"T3 spark ({n} node{'s' if n > 1 else ''})", "spark", n, reps))
+        rows.append(measure(f"T3 spark ({n} node{'s' if n > 1 else ''})", "spark", n,
+                            reps, warmup=warmup))
     if all(r["outcome"] == "ok" for r in rows):
         check_parity()
     return rows
@@ -207,11 +250,11 @@ def experiment_memory(scale, nodes) -> list:
     set_cluster(nodes)
     rows.append(measure(f"T3 spark ({nodes} nodes)", "spark", nodes, 1))
     for r in rows:
+        # rc=137 is SIGKILL, which for a memory-limited container means the cgroup
+        # OOM killer. The container's own .State.OOMKilled flag is NOT usable here:
+        # it is sticky once set, so a later unrelated failure reads as an OOM.
         if r["outcome"] == "failed":
-            name = {"pandas": "baseline", "chunked": "baseline"}.get(r["tier"])
-            if name:
-                r["oom_killed"] = sh(["docker", "inspect", "-f", "{{.State.OOMKilled}}",
-                                      name]).stdout.strip() == "true"
+            r["oom_killed"] = "rc=137" in r.get("error", "")
     return rows
 
 
@@ -228,6 +271,30 @@ def experiment_weak(scales, node_counts, reps) -> list:
     return rows
 
 
+def experiment_slots(scale, slot_counts, reps, shuffle=16) -> list:
+    """Oversubscribe ONE core with N task slots, against every other approach.
+
+    Shuffle partitions are pinned to a constant so slot count is the only variable.
+    The reference rows are re-measured in the same session rather than reused from
+    an earlier run, because the point is a head-to-head.
+    """
+    print(f"\n[task slots] one pinned core, {slot_counts} slots vs everything else")
+    gen(scale)
+    set_cluster(0)
+    rows = [measure("T1 pandas (1 core)", "pandas", 1, reps),
+            measure("T2 chunked (1 core)", "chunked", 1, reps, procs=1),
+            measure("T2 chunked (4-core box)", "chunked", 4, reps, procs=4)]
+    for sl in slot_counts:
+        set_slots(sl)
+        rows.append(measure(f"T3 spark (1 node, {sl} slot{'s' if sl > 1 else ''})",
+                            "spark", 1, reps, slots=sl, shuffle=shuffle))
+    set_slots(1)
+    set_cluster(4)
+    rows.append(measure("T3 spark (4 nodes, 1 slot)", "spark", 4, reps,
+                        slots=1, shuffle=shuffle))
+    return rows
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--experiments", default="calibrate,strong,small,memory")
@@ -237,40 +304,51 @@ def main():
     ap.add_argument("--memory-scale", default="l")
     ap.add_argument("--weak-scales", default="s,m,l")
     ap.add_argument("--nodes", default="1,2,4")
+    ap.add_argument("--slots", default="1,2,4,10")
     ap.add_argument("--reps", type=int, default=3)
+    ap.add_argument("--skip-tiers", default="",
+                    help="comma-separated tiers to skip, e.g. 'pandas' at scales "
+                         "where it is a guaranteed OOM")
+    ap.add_argument("--no-warmup", action="store_true",
+                    help="skip the discarded warm-up run (use at the largest scales)")
     ap.add_argument("--out", default=os.path.join(ROOT, "results", "results.json"))
     a = ap.parse_args()
 
-    nodes = [int(x) for x in a.nodes.split(",")]
-    wanted = a.experiments.split(",")
-    ensure_created()
+    with data_lock(os.path.join(ROOT, "data"), "benchmark runner"):
+        nodes = [int(x) for x in a.nodes.split(",")]
+        wanted = a.experiments.split(",")
+        ensure_created()
 
-    res = {"config": vars(a),
-           "host": {"cpus": int(sh(["nproc"]).stdout.strip()),
-                    "node": "1 pinned physical core + 2 GB",
-                    "cpu_model": next((l.split(":", 1)[1].strip()
-                                       for l in sh(["lscpu"]).stdout.splitlines()
-                                       if l.startswith("Model name")), "unknown")},
-           "experiments": {}}
+        res = {"config": vars(a),
+               "host": {"cpus": int(sh(["nproc"]).stdout.strip()),
+                        "node": "1 pinned physical core + 2 GB",
+                        "cpu_model": next((l.split(":", 1)[1].strip()
+                                           for l in sh(["lscpu"]).stdout.splitlines()
+                                           if l.startswith("Model name")), "unknown")},
+               "experiments": {}}
 
-    if "calibrate" in wanted:
-        res["experiments"]["calibrate"] = experiment_calibrate()
-    if "strong" in wanted:
-        # One curve per dataset size: scalability is not a property of the code
-        # alone, it improves as the per-node work grows relative to fixed costs.
-        for sc in a.scale.split(","):
-            res["experiments"][f"strong@{sc}"] = experiment_strong(sc, nodes, a.reps)
-    if "weak" in wanted:
-        res["experiments"]["weak"] = experiment_weak(a.weak_scales.split(","), nodes, a.reps)
-    if "small" in wanted:
-        res["experiments"]["small"] = experiment_small(a.small_scale, max(nodes), a.reps)
-    if "memory" in wanted:
-        res["experiments"]["memory"] = experiment_memory(a.memory_scale, max(nodes))
+        if "calibrate" in wanted:
+            res["experiments"]["calibrate"] = experiment_calibrate()
+        if "strong" in wanted:
+            # One curve per dataset size: scalability is not a property of the code
+            # alone, it improves as the per-node work grows relative to fixed costs.
+            for sc in a.scale.split(","):
+                res["experiments"][f"strong@{sc}"] = experiment_strong(
+                    sc, nodes, a.reps, warmup=not a.no_warmup)
+        if "weak" in wanted:
+            res["experiments"]["weak"] = experiment_weak(a.weak_scales.split(","), nodes, a.reps)
+        if "small" in wanted:
+            res["experiments"]["small"] = experiment_small(a.small_scale, max(nodes), a.reps)
+        if "slots" in wanted:
+            res["experiments"]["slots"] = experiment_slots(
+                a.scale.split(",")[0], [int(x) for x in a.slots.split(",")], a.reps)
+        if "memory" in wanted:
+            res["experiments"]["memory"] = experiment_memory(a.memory_scale, max(nodes))
 
-    os.makedirs(os.path.dirname(a.out), exist_ok=True)
-    with open(a.out, "w") as fh:
-        json.dump(res, fh, indent=2)
-    print(f"\nwrote {a.out}")
+        os.makedirs(os.path.dirname(a.out), exist_ok=True)
+        with open(a.out, "w") as fh:
+            json.dump(res, fh, indent=2)
+        print(f"\nwrote {a.out}")
 
 
 if __name__ == "__main__":
