@@ -1,0 +1,140 @@
+# Every container is a stand-in for a machine, pinned to its OWN physical core.
+#
+# Why pinning matters (this project learned it the hard way -- see RESULTS.md):
+# the dev host is an i7-1365U, 2 fast P-cores + 8 slow E-cores under a 15 W power
+# budget. Unpinned, two concurrent CPU-bound threads run ~3x SLOWER than one, so
+# every scaling curve came out flat and it looked like Spark could not scale. Pinned
+# to homogeneous E-cores, 6 concurrent tasks finish in the same wall time as 1.
+#
+# So: one node == one dedicated E-core + 2 GB. The driver gets the P-cores because
+# coordination overhead is constant across cluster sizes and must never become the
+# thing being measured. Override the CPU ids for your own machine's topology.
+x-node: &node
+  mem_limit: 2g
+
+x-common: &common
+  image: scaling-demo:latest
+  # tini as PID 1. Without it `sleep infinity` is PID 1, never reaps orphaned
+  # children, and every `docker exec` of a Spark job leaks a defunct JVM.
+  init: true
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+  volumes:
+    - ../data:/data
+    - ../results:/results
+    - ../src:/app/src
+  networks: [cluster]
+
+services:
+  spark-master:
+    <<: [*common, *node]
+    container_name: spark-master
+    cpuset: "${MASTER_CPU:-10}"
+    command: >
+      spark-class org.apache.spark.deploy.master.Master
+      --host spark-master --port 7077 --webui-port 8080
+    ports: ["8080:8080"]
+
+  # The driver. Long-lived so executors always find it at a stable hostname, and on
+  # the fast cores so that DAG scheduling never becomes the bottleneck.
+  spark-client:
+    <<: *common
+    container_name: spark-client
+    cpuset: "${DRIVER_CPUS:-0,1}"
+    mem_limit: 3g
+    command: sleep infinity
+    depends_on: [spark-master]
+    environment:
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_DRIVER_HOST: spark-client
+      SPARK_EXECUTOR_MEMORY: 1400m
+      SPARK_EXECUTOR_CORES: "1"
+
+  spark-worker-1:
+    <<: [*common, *node]
+    container_name: spark-worker-1
+    cpuset: "${WORKER1_CPU:-4}"
+    command: >
+      spark-class org.apache.spark.deploy.worker.Worker
+      spark://spark-master:7077 --cores ${WORKER_CORES:-1}
+      --memory 1600m --webui-port 8081
+    depends_on: [spark-master]
+    profiles: ["w1"]
+
+  spark-worker-2:
+    <<: [*common, *node]
+    container_name: spark-worker-2
+    cpuset: "${WORKER2_CPU:-5}"
+    command: >
+      spark-class org.apache.spark.deploy.worker.Worker
+      spark://spark-master:7077 --cores ${WORKER_CORES:-1}
+      --memory 1600m --webui-port 8081
+    depends_on: [spark-master]
+    profiles: ["w2"]
+
+  spark-worker-3:
+    <<: [*common, *node]
+    container_name: spark-worker-3
+    cpuset: "${WORKER3_CPU:-6}"
+    command: >
+      spark-class org.apache.spark.deploy.worker.Worker
+      spark://spark-master:7077 --cores ${WORKER_CORES:-1}
+      --memory 1600m --webui-port 8081
+    depends_on: [spark-master]
+    profiles: ["w3"]
+
+  spark-worker-4:
+    <<: [*common, *node]
+    container_name: spark-worker-4
+    cpuset: "${WORKER4_CPU:-7}"
+    command: >
+      spark-class org.apache.spark.deploy.worker.Worker
+      spark://spark-master:7077 --cores ${WORKER_CORES:-1}
+      --memory 1600m --webui-port 8081
+    depends_on: [spark-master]
+    profiles: ["w4"]
+
+  spark-worker-5:
+    <<: [*common, *node]
+    container_name: spark-worker-5
+    cpuset: "${WORKER5_CPU:-8}"
+    command: >
+      spark-class org.apache.spark.deploy.worker.Worker
+      spark://spark-master:7077 --cores ${WORKER_CORES:-1}
+      --memory 1600m --webui-port 8081
+    depends_on: [spark-master]
+    profiles: ["w5"]
+
+  spark-worker-6:
+    <<: [*common, *node]
+    container_name: spark-worker-6
+    cpuset: "${WORKER6_CPU:-9}"
+    command: >
+      spark-class org.apache.spark.deploy.worker.Worker
+      spark://spark-master:7077 --cores ${WORKER_CORES:-1}
+      --memory 1600m --webui-port 8081
+    depends_on: [spark-master]
+    profiles: ["w6"]
+
+  # Tier 1/2's world: ONE node, identical to a single worker. This is the machine
+  # the original script ran on.
+  baseline:
+    <<: [*common, *node]
+    container_name: baseline
+    cpuset: "${BASELINE_CPU:-4}"
+    command: sleep infinity
+
+  # "Just buy a bigger machine." 4 cores / 8 GB == the total resources of the 4-node
+  # cluster, in one box. Same silicon, different topology: this is the control group
+  # that turns "distributed is faster" into a claim you can actually falsify.
+  baseline-big:
+    <<: *common
+    container_name: baseline-big
+    cpuset: "${BIG_CPUS:-4,5,6,7}"
+    mem_limit: 8g
+    command: sleep infinity
+
+networks:
+  cluster:
+    driver: bridge

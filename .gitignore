@@ -1,0 +1,10 @@
+data/trips/
+data/zones/
+data/out/
+results/*.json
+results/*.png
+results/*.log
+results/RESULTS.md
+results/spark_plan.txt
+__pycache__/
+*.pyc
