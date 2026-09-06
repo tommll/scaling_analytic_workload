@@ -4,11 +4,6 @@ A trip-analytics pipeline written three ways — **single-process pandas**, **mu
 pandas on one box**, and **Spark on a cluster of pinned single-core nodes** — with a
 benchmark harness that measures what each rewrite actually bought.
 
-The interesting part is not that Spark exists. It is *when distribution wins, when it
-loses, and how to measure the difference without fooling yourself*. The suite therefore
-reports the configurations where the distributed version is **slower**, and the one where
-the single-node version does not merely lose but **dies**.
-
 Everything is free and open source: Python, pandas, PyArrow, Apache Spark, Docker Compose,
 matplotlib. No cloud account, one laptop.
 
